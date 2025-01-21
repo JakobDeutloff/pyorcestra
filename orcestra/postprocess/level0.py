@@ -28,12 +28,10 @@ def _radar_add_dBZ(ds):
         "units": "dBZg",
         "long_name": "Decadal logarithm of equivalent radar reflectivity of all targets (Zg)",
     }
-    ds.dBZe.attrs = (
-        {
-            "units": "dBZe",
-            "long_name": "Decadal logarithm of equivalent radar reflectivity of hydrometeors (Ze)",
-        },
-    )
+    ds.dBZe.attrs = {
+        "units": "dBZe",
+        "long_name": "Decadal logarithm of equivalent radar reflectivity of hydrometeors (Ze)",
+    }
 
     return ds
 
