@@ -3,6 +3,7 @@ import xarray as xr
 import json
 import os
 import pandas as pd
+from scipy.ndimage import convolve
 
 # Get the directory of the current script
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -171,6 +172,37 @@ def _filter_land(ds, sea_land_mask, offset=pd.Timedelta("7s")):
     return ds.pipe(_selective_where, (mask_path == 1).drop(["lat", "lon"]))
 
 
+def _filter_clutter(ds):
+    """Filter radar data for clutter.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Level1 radar dataset.
+
+    Returns
+    -------
+    xr.Dataset
+        Radar data filtered for clutter.
+    """
+    kernel = np.array(
+        [
+            [1, 1, 1, 1, 1],
+            [1, 0, 0, 0, 1],
+            [1, 0, 0, 0, 1],
+            [1, 0, 0, 0, 1],
+            [1, 1, 1, 1, 1],
+        ]
+    )
+
+    for var in [var for var in ds if ds[var].dims == ("time", "height")]:
+        ds_binary = ~np.isnan(ds[var])
+        neighbour_count = convolve(ds_binary, kernel, mode="constant", cval=False)
+        clutter_mask = (ds_binary) & (not neighbour_count)
+        ds = ds.assign({var: ds[var].where(~clutter_mask, np.nan)})
+    return ds
+
+
 def filter_radar(ds):
     """Filter radar data for noise, valid radar states, and roll angle.
 
@@ -190,6 +222,7 @@ def filter_radar(ds):
         .pipe(_state_filter_radar)
         .pipe(_roll_filter)
         .pipe(_trim_dataset)
+        .pipe(_filter_clutter)
     )
 
 
