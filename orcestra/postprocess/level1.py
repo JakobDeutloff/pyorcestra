@@ -4,6 +4,7 @@ import json
 import os
 import pandas as pd
 from scipy.ndimage import convolve
+from orcestra.utils import get_flight_segments
 
 # Get the directory of the current script
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -75,23 +76,6 @@ def _state_filter_radar(ds):
     """
 
     return ds.pipe(_selective_where, (ds.grst == config["valid_radar_state"]))
-
-
-def _roll_filter(ds):
-    """Filter any dataset by plane roll angle.
-
-    Parameters
-    ----------
-    ds : xr.Dataset
-        Level1 dataset.
-
-    Returns
-    -------
-    xr.Dataset
-        Dataset filtered by plane roll angle.
-    """
-
-    return ds.pipe(_selective_where, (np.abs(ds.plane_roll) < config["roll_threshold"]))
 
 
 def _altitude_filter(ds):
@@ -203,6 +187,170 @@ def _filter_clutter(ds):
     return ds
 
 
+def _add_clibration_mask(ds):
+    """
+    Add a mask for radar calibration segments to the radar dataset.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Level1 radar dataset.
+    Returns
+    -------
+    xr.Dataset
+        Radar dataset with a mask for radar calibration segments.
+    """
+
+    meta = get_flight_segments()
+    radar_calib = [
+        {**s, "platform_id": platform_id, "flight_id": flight_id}
+        for platform_id, flights in meta.items()
+        for flight_id, flight in flights.items()
+        for s in flight["segments"]
+        if "radar_calibration_wiggle" in s["kinds"]
+    ]
+
+    radar_calib_flight = [s for s in radar_calib if s["flight_id"] == ds.flight_id]
+    mask_calib = xr.DataArray(
+        np.zeros(ds.time.shape, dtype=bool),
+        dims="time",
+        coords={"time": ds.time},
+        attrs={
+            "long_name": "Mask for radar calibration segments",
+            "description": "0 indicates no radar calibration, 1 indicates radar calibration",
+        },
+    )
+    for s in radar_calib_flight:
+        mask_calib.loc[{"time": slice(s["start"], s["end"])}] = True
+
+    ds = ds.assign(mask_calibration=mask_calib)
+
+    return ds
+
+
+def _add_ground_mask(ds, sea_land_mask, threshold=40):
+    """
+    Add a mask for ground reflections to the radar dataset.
+
+    The mask is created by identifying the first height level coming from the top for which dBZg exceeds the given threshold.
+    All cells below this height level are considered to be ground reflections.
+
+    Parameters
+    ----------
+    ds_radar : xr.Dataset
+        Level1 radar dataset.
+    sea_land_mask : xr.Dataset
+        Dataset containing a mask for land and ocean. The mask should have the dimensions lat and lon.
+        1 indicates ocean, 0 indicates land.
+    threshold : int, optional
+        dBZg threshold for ground reflection, by default 40.
+    Returns
+    -------
+    xr.Dataset
+        Radar dataset with a mask for ground reflections.
+    """
+
+    # get land or sea mask along track
+    sea_mask = (
+        sea_land_mask["mask"]
+        .sel(lat=ds.lat, lon=ds.lon, method="nearest")
+        .drop_vars(["lat", "lon"])
+    )
+
+    # get first height level coming from the top that exceeds 30 dbZg
+    strong_signal = (ds.dBZg > threshold) * ds.height
+    max_height = strong_signal.idxmax("height").interpolate_na(
+        dim="time", method="linear"
+    )
+
+    # create mask for land and ocean
+    dz = ds.height.diff("height").mean().values
+    mask_land = ds.height <= (max_height + 6 * dz)
+    mask_ocean = ds.height <= (max_height + 2 * dz)
+    mask_ground_return = xr.where(sea_mask, mask_ocean, mask_land)
+
+    # add mask to dataset
+    ds = ds.assign(mask_ground_return=mask_ground_return)
+    ds["mask_ground_return"].attrs = {
+        "long_name": "Mask for ground reflections",
+        "description": "1 indicates ground reflection, 0 indicates no ground reflection",
+    }
+
+    return ds
+
+
+def _add_roll_mask(ds):
+    """
+    Add a mask for roll segments to the radar dataset.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Level1 radar dataset.
+    Returns
+    -------
+    xr.Dataset
+        Radar dataset with a mask for roll segments.
+    """
+
+    mask_roll = np.abs(ds.plane_roll) > 5
+    mask_roll.attrs = {
+        "long_name": "Mask for roll segments",
+        "description": "1 indicates roll higher 5 deg, 0 indicates roll lower 5 deg",
+    }
+    ds = ds.assign(mask_roll=mask_roll)
+
+    return ds
+
+
+def add_metadata_radar(ds, flight_id):
+    """
+    Add metadata to the radar dataset.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Level1 radar dataset.
+    Returns
+    -------
+    xr.Dataset
+        Radar dataset with metadata.
+    """
+
+    # add new attrs
+    ds.attrs["flight_id"] = flight_id
+    ds.attrs["title"] = "MIRA Cloud Radar Data Moments"
+    ds.attrs["summary"] = (
+        "Processed data from the MIRA cloud radar onboard the HALO aircraft"
+    )
+    ds.attrs["creator_name"] = ["Jakob Deutloff", "Lukas Kluft"]
+    ds.attrs["creator_email"] = [
+        "jakob.deutloff@uni-hamburg.de",
+        "lukas.kluft@mpimet.mpg.de",
+    ]
+    ds.attrs["project"] = ["ORCESTRA", "PERCUSION"]
+    ds.attrs["platform"] = "HALO"
+    ds.attrs["history"] = "The processing software is available at [doi to zenodo git]"
+    ds.attrs["license"] = "tbd"
+    ds.attrs["references"] = ["10.5194/amt-12-1815-2019", "10.5194/essd-13-5545-2021"]
+    ds.attrs["keywords"] = [
+        "Cloud Radar",
+        "HALO",
+        "ORCESTRA",
+        "PERCUSION",
+        "Tropical Atlantic",
+    ]
+
+    # remove oudated attrs
+    ds.attrs.pop("Copywright", None)
+    ds.attrs.pop("Copywright_Owner", None)
+    ds.attrs.pop("Latitude", None)
+    ds.attrs.pop("Longitude", None)
+    ds.attrs.pop("Altitude", None)
+
+    return ds
+
+
 def filter_radar(ds):
     """Filter radar data for noise, valid radar states, and roll angle.
 
@@ -220,7 +368,6 @@ def filter_radar(ds):
     return (
         ds.pipe(_noise_filter_radar)
         .pipe(_state_filter_radar)
-        .pipe(_roll_filter)
         .pipe(_trim_dataset)
         .pipe(_filter_clutter)
     )
@@ -251,10 +398,30 @@ def filter_radiometer(ds, sea_land_mask):
     """
 
     return (
-        ds.pipe(_altitude_filter)
-        .pipe(_roll_filter)
-        .pipe(_trim_dataset)
-        .pipe(_filter_land, sea_land_mask)
+        ds.pipe(_altitude_filter).pipe(_trim_dataset).pipe(_filter_land, sea_land_mask)
+    )
+
+
+def add_masks_radar(ds, sea_land_mask):
+    """Add masks to radar data for calibration, ground reflections, and roll segments.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        Level1 radar dataset.
+    sea_land_mask : xr.DataArray
+        Mask of land and sea. 1 for sea, 0 for land.
+
+    Returns
+    -------
+    xr.Dataset
+        Radar dataset with masks for calibration, ground reflections, and roll segments.
+    """
+
+    return (
+        ds.pipe(_add_clibration_mask)
+        .pipe(_add_ground_mask, sea_land_mask)
+        .pipe(_add_roll_mask)
     )
 
 
